@@ -1,0 +1,32 @@
+# ===== 密钥与环境配置（绝不提交） =====
+.env
+.env.*
+!.env.example
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+env/
+
+# ===== Streamlit 本地密钥 =====
+.streamlit/secrets.toml
+
+# ===== IDE / 编辑器 =====
+.vscode/
+.idea/
+*.swp
+
+# ===== 系统文件 =====
+.DS_Store
+Thumbs.db
+
+# ===== 临时与测试文件 =====
+_test_*.py
+*.log
