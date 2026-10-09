@@ -9,6 +9,8 @@ CodeMate —— C 语言编程陪练智能体
 
 import os
 import re
+import traceback
+import unicodedata
 from pathlib import Path
 
 import streamlit as st
@@ -39,6 +41,55 @@ try:
 except Exception:
     # 本地未配置任何 secrets 时 st.secrets 可能不可用，忽略即可
     pass
+
+
+# ---------------------------------------------------------------------------
+# API Key 清洗与校验
+# ---------------------------------------------------------------------------
+# 零宽字符、BOM 等不可见字符会导致鉴权莫名其妙失败，这里统一清理。
+_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff\u202a-\u202e]")
+
+
+def sanitize_api_key(value: str) -> tuple[str, dict]:
+    """清洗 API Key，并返回 (清洗后的 key, 元信息)。
+
+    元信息包含：is_ascii、starts_with_sk、length、masked（前 3 位 + 长度），
+    不包含完整 key，可安全展示。
+    """
+    if value is None:
+        value = ""
+    # 1) unicode 规范化（NFKC 可让全角字符变半角等）
+    value = unicodedata.normalize("NFKC", value)
+    # 2) 去掉零宽字符与 BOM
+    value = _ZERO_WIDTH_RE.sub("", value)
+    # 3) 去掉首尾空白（含空格、换行、制表符）
+    value = value.strip()
+    # 4) 去掉首尾成对的引号（英文单双引号、中文引号）
+    while len(value) >= 2 and value[0] in "\"'\u201c\u2018\u300c\u300e" and value[-1] in "\"'\u201d\u2019\u300d\u300f":
+        value = value[1:-1]
+    # 5) 用户误填 "Bearer sk-xxx" 时去掉 Bearer 前缀
+    if value.lower().startswith("bearer "):
+        value = value[len("Bearer "):].strip()
+    # 去掉前缀后再次去引号
+    while len(value) >= 2 and value[0] in "\"'\u201c\u2018\u300c\u300e" and value[-1] in "\"'\u201d\u2019\u300d\u300f":
+        value = value[1:-1]
+
+    length = len(value)
+    masked = f"{value[:3]}... (长度 {length})" if length else "(空)"
+    meta = {
+        "is_ascii": all(ord(c) < 128 for c in value),
+        "starts_with_sk": value.startswith("sk-"),
+        "length": length,
+        "masked": masked,
+    }
+    return value, meta
+
+
+def is_placeholder_key(api_key: str) -> bool:
+    """识别 .env 模板里未替换的占位符假 Key。"""
+    cleaned, _ = sanitize_api_key(api_key)
+    return (not cleaned) or ("在这里" in cleaned) or ("替换" in cleaned)
+
 
 # ---------------------------------------------------------------------------
 # 智能体系统提示词（规定角色、七段式回答格式、禁止直接给完整代码）
@@ -120,10 +171,15 @@ def build_user_message(code: str, question: str) -> str:
 
 
 def diagnose(api_key: str, base_url: str, model: str, code: str, question: str):
-    """流式调用大模型，逐段产出诊断文本。"""
-    client = OpenAI(api_key=api_key, base_url=base_url)
+    """流式调用大模型，逐段产出诊断文本。
+
+    传入的 api_key 会先经过 sanitize_api_key 清洗（去零宽字符、去引号、去 Bearer 前缀等），
+    保证不会因为复制粘贴带入的不可见字符导致鉴权失败。
+    """
+    cleaned_key, _ = sanitize_api_key(api_key)
+    client = OpenAI(api_key=cleaned_key, base_url=base_url.strip())
     stream = client.chat.completions.create(
-        model=model,
+        model=model.strip(),
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT.format(knowledge=load_knowledge())},
             {"role": "user", "content": build_user_message(code, question)},
@@ -240,10 +296,68 @@ def _detect_loop_boundary(code: str) -> bool:
     return re.search(r"for\s*\([^;]*;[^;]*<=\s*[^;]+;", _strip_comments(code)) is not None
 
 
+def _extract_block_body(src: str, open_brace_idx: int) -> str:
+    """从 src[open_brace_idx] 处的 '{' 开始，提取到大括号块内部的内容。"""
+    depth = 0
+    i = open_brace_idx
+    while i < len(src):
+        c = src[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return src[open_brace_idx + 1:i]
+        i += 1
+    return src[open_brace_idx + 1:]
+
+
+def _detect_init_position(code: str):
+    """识别“累计变量 / max / min 初始化位置或初始值不当”。
+
+    两种子问题：
+    1. sum/count/max/min 在循环体内被重复初始化（每轮重置）；
+    2. max = 0（而非用数组首元素初始化），全负数输入时会得到错误结果。
+
+    返回 (detail, None) 或 None。
+    """
+    src = _strip_comments(code)
+
+    # 子问题 1：在 for/while 循环体内部出现 sum/count/max/min = 0 或 int xxx = 0
+    loop_vars = ("sum", "count", "max", "min")
+    init_inside = []
+    for m in re.finditer(r"\b(?:for|while)\s*\([^)]*\)\s*\{", src):
+        body = _extract_block_body(src, m.end() - 1)
+        for var in loop_vars:
+            # 匹配 var = 0 或 var = 其它字面量 / int var = ...
+            if re.search(rf"\b{var}\s*=\s*(?:0|\d+)", body) or \
+               re.search(rf"\bint\s+{var}\s*=", body) or \
+               re.search(rf"\b{var}\s*\+=\s*0", body):
+                init_inside.append(var)
+
+    if init_inside:
+        return (
+            f"检测到累计变量 `{'`、`'.join(init_inside)}` 在循环体内部被初始化（如 `= 0`），"
+            "这会导致它每一轮都被重置，累加/求最值的结果自然不对。"
+        )
+
+    # 子问题 2：max 被初始化为 0，但代码看起来在求数组/序列的最大值（全负数时 0 会“伪胜利”）
+    if re.search(r"\bmax\s*=\s*0\b", src) or re.search(r"\bint\s+max\s*=\s*0\b", src):
+        has_array_compare = re.search(r"a\w*\s*\[\s*\w+\s*\]\s*>\s*max", src) or \
+                            re.search(r"max\s*=\s*\w+\s*\[\s*\w+\s*\]", src)
+        if has_array_compare or re.search(r"\bfor\b", src):
+            return (
+                "检测到求最大值时把 `max` 初始化成了 `0`。如果输入数据全是负数，"
+                "0 会一直“赢”，最终得到错误的最大值 0。"
+            )
+
+    return None
+
+
 def detect_demo_case(code: str, question: str):
     """综合问题描述关键词与代码规则，判断演示案例类型。
 
-    返回 (case_key, detail)：case_key ∈ semicolon / array / loop / generic。
+    返回 (case_key, detail)：case_key ∈ semicolon / array / loop / init / generic。
     """
     text = question or ""
     # 学生在问题里直接点名了问题类型时，优先采信
@@ -253,10 +367,15 @@ def detect_demo_case(code: str, question: str):
         return "array", None
     if re.search(r"边界|差一|多一次|少一次|多一圈|少一圈", text):
         return "loop", None
+    if re.search(r"初始化|最大值|最小值|max|min|累加|累计", text, re.IGNORECASE):
+        return "init", None
 
     array_detail = _detect_array_out_of_bounds(code)
     if array_detail:
         return "array", array_detail
+    init_detail = _detect_init_position(code)
+    if init_detail:
+        return "init", init_detail
     missing, _ = _detect_missing_semicolon(code)
     if missing:
         return "semicolon", None
@@ -341,8 +460,31 @@ MOCK_TEMPLATES = {
         "边界感是循环学习中最值得打磨的基本功。你已经开始怀疑“循环次数”这一层，"
         "说明正在像程序员一样思考问题，多用首尾代入法练几题就会越来越稳！",
     ],
+    "init": [
+        "问题属于**初始化位置或初始值选择不当**：程序能编译运行，但最大值、最小值、求和、计数等结果不对。"
+        "这类错误很隐蔽——没有报错，只是数值差一点，容易让人怀疑编译器。",
+        "- 累计变量（sum、count）被放在了循环体内部初始化，每一轮都被重置成 0，最终只剩最后一轮的值；\n"
+        "- 求最大值时把 `max` 初始化为 `0`，如果输入全是负数，0 永远比任何输入都大，结果就错了；\n"
+        "- 同理 `min = 0` 在全正数输入时也会出问题；\n"
+        "- 变量作用域没理清：以为“定义在循环外”，实际写成了“循环内的局部变量”。",
+        "- **变量作用域**：在 `{}` 内定义的变量只在该块内有效，循环每次进入都会重新创建；\n"
+        "- **累计变量的标准位置**：`sum = 0`、`count = 0` 必须写在循环**之前**；\n"
+        "- **最大值/最小值的初始值选择**：不知道数据范围时，用**第一个元素**初始化最安全，比用 0 更通用。",
+        "1. 找到 `sum` / `count` / `max` / `min` 被赋值为 0（或其它初值）的那一行，确认它在循环的**外面还是里面**；\n"
+        "2. 在循环体里临时 `printf` 打印每一轮结束后该变量的值，看它是不是每轮都被重置；\n"
+        "3. 如果是 max/min 问题，构造一组全负数（求最大值）或全正数（求最小值）的测试数据跑一遍，看结果是否正确；\n"
+        "4. 在纸上手动跟踪两轮循环，记录变量值的变化，问题通常一眼就能看出来。",
+        "两个修改方向，请你自己动手：① 把 `sum=0` / `count=0` 这类初始化语句**移到循环之前**；"
+        "② 求最大值/最小值时，把 `max=0` 改成**用数组第一个元素初始化**（如 `max = a[0]`，循环从下标 1 开始），"
+        "这样无论输入正负都不会出错。改完后用全负数测试再验证一次。",
+        "- **练习 10：1 到 100 求和**（★）——最直接的累加器初始化练习；\n"
+        "- **练习 16：成绩统计**（★）——同时练 sum、max、min 三个累计变量的初始化位置；\n"
+        "- **练习：找出数组中的最大值与最小值**（★★）——重点练习用首元素初始化 max/min，而非写死 0。",
+        "初始化位置是循环和数组这一关的核心概念，你已经能定位到“结果不对”这一层，说明调试直觉在进步。"
+        "记住一个口诀：**累计变量在循环外初始化，循环内只更新不重置**，多练两题就能形成肌肉记忆。",
+    ],
     "generic": [
-        "本地模拟模式暂时无法确定你代码中的具体问题（演示版内置识别三类案例：少分号、数组越界、循环边界）。"
+        "本地模拟模式暂时无法确定你代码中的具体问题（演示版内置识别四类案例：少分号、数组越界、循环边界、初始化位置）。"
         "下面给出一份通用排查指引，按顺序走一遍，通常能定位大部分入门问题。",
         "- 先看编译器的**第一条**报错信息及其行号（必要时往上看一行）；\n"
         "- 高频原因：漏分号、括号不配对、变量未定义、`scanf` 漏写 `&`、占位符与类型不匹配；\n"
@@ -384,12 +526,6 @@ def mock_diagnose(code: str, question: str):
         yield line + "\n"
 
 
-def is_placeholder_key(api_key: str) -> bool:
-    """识别 .env 模板里未替换的占位符假 Key。"""
-    key = api_key.strip()
-    return (not key) or ("在这里" in key) or ("替换" in key)
-
-
 # ---------------------------------------------------------------------------
 # Streamlit 页面
 # ---------------------------------------------------------------------------
@@ -415,30 +551,44 @@ with st.sidebar:
     )
     base_url = st.text_input(
         "LLM_BASE_URL（接口地址）",
-        value=os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1"),
+        value=os.getenv("LLM_BASE_URL", "https://api.deepseek.com"),
     )
     model = st.text_input(
         "LLM_MODEL（模型名称）",
         value=os.getenv("LLM_MODEL", "deepseek-chat"),
     )
 
+    # 对当前输入的 key 做一次清洗与校验，仅展示掩码信息，绝不打印完整 key
+    cleaned_key, key_meta = sanitize_api_key(api_key)
+
     st.divider()
     force_mock = st.checkbox(
         "使用本地模拟模式（无需 API Key）",
         value=False,
-        help="开启后不联网、不消耗额度，使用内置规则对“少分号 / 数组越界 / 循环边界”三类演示案例返回固定诊断。",
+        help="开启后不联网、不消耗额度，使用内置规则对“少分号 / 数组越界 / 循环边界 / 初始化位置”四类演示案例返回固定诊断。",
     )
+    debug_mode = st.checkbox(
+        "显示调试信息",
+        value=False,
+        help="开启后在结果区显示 base_url、model、key 掩码、是否 ASCII、长度及异常 traceback。",
+    )
+
     if force_mock:
         st.info("已开启本地模拟模式：可直接点击“开始诊断”体验完整流程。")
-    elif not is_placeholder_key(api_key):
-        st.success("已读取到有效 API Key，将调用真实大模型诊断。")
+    elif not is_placeholder_key(api_key) and key_meta["starts_with_sk"] and key_meta["is_ascii"]:
+        st.success(f"已读取到有效 API Key（{key_meta['masked']}），将调用真实大模型诊断。")
     else:
-        st.warning("未配置有效 API Key：诊断时将自动使用本地模拟模式。")
+        hint = "未配置有效 API Key：诊断时将自动使用本地模拟模式。"
+        if cleaned_key and not key_meta["starts_with_sk"]:
+            hint += "（注意：Key 需以 sk- 开头）"
+        if cleaned_key and not key_meta["is_ascii"]:
+            hint += "（注意：Key 包含非 ASCII 字符，通常是复制时带入了隐藏字符）"
+        st.warning(hint)
 
     with st.expander("支持哪些大模型？"):
         st.markdown(
             "任何兼容 OpenAI 接口协议的服务都可以，例如：\n\n"
-            "- DeepSeek：`https://api.deepseek.com/v1`，模型 `deepseek-chat`\n"
+            "- **DeepSeek（推荐）**：`https://api.deepseek.com` 或兼容 `https://api.deepseek.com/v1`，模型 `deepseek-chat`\n"
             "- OpenAI：`https://api.openai.com/v1`，模型 `gpt-4o-mini`\n"
             "- 智谱 GLM：`https://open.bigmodel.cn/api/paas/v4`，模型 `glm-4-flash`\n"
             "- Moonshot：`https://api.moonshot.cn/v1`，模型 `moonshot-v1-8k`"
@@ -468,6 +618,8 @@ if start_clicked:
     st.divider()
     st.subheader("诊断结果")
 
+    # 每次结果顶部的来源标识，方便录视频时一眼看出是不是大模型真的在工作
+    source_badge = st.empty()
     answer_placeholder = st.empty()
     full_answer = ""
 
@@ -483,51 +635,82 @@ if start_clicked:
         mock_reason = ""
         banner_level = None
 
+    error_traceback = None
+
     if not use_mock:
+        source_badge.info("⏳ 当前结果来源：正在调用大模型……")
         # 优先尝试真实大模型；任何异常都自动降级到本地模拟模式
         try:
             with st.spinner("CodeMate 正在阅读你的代码，请稍候……"):
                 for piece in diagnose(
-                    api_key=api_key.strip(),
-                    base_url=base_url.strip(),
-                    model=model.strip(),
+                    api_key=cleaned_key,        # 使用清洗后的 key
+                    base_url=base_url,
+                    model=model,
                     code=code,
                     question=question,
                 ):
                     full_answer += piece
                     answer_placeholder.markdown(full_answer)
         except Exception as exc:  # 网络错误、Key 错误、限流等：不直接报错，降级
+            # 1) 在服务端控制台打印完整 traceback，便于排查
+            print("[CodeMate] 大模型调用异常：")
+            print(traceback.format_exc())
+            # 2) 页面只显示简洁错误类型，不泄露敏感信息
             use_mock = True
-            mock_reason = f"大模型调用失败（{exc}）"
+            error_traceback = traceback.format_exc()
+            mock_reason = f"大模型调用失败，已切换到本地规则模式。错误类型：{type(exc).__name__}"
             banner_level = "warning"
             full_answer = ""
         else:
+            source_badge.success("✅ 当前结果来源：大模型诊断")
             st.session_state["last_answer"] = full_answer
             st.session_state["last_mode"] = "llm"
             st.success("诊断完成！先按提示自己动手改一改，改完可以再来诊断一次。")
 
     if use_mock:
+        source_badge.warning("⚠️ 当前结果来源：本地规则兜底")
         banner = (
-            f"{mock_reason}，已自动切换到**本地模拟模式**（不联网、不消耗额度）。"
-            "以下为内置规则生成的演示诊断，当前可识别：少分号、数组越界、循环边界。"
+            f"{mock_reason}，已切换到**本地规则模式**（不联网、不消耗额度）。"
+            "以下为内置规则生成的演示诊断，当前可识别：少分号、数组越界、循环边界、初始化位置。"
         )
         if banner_level == "warning":
             st.warning(banner)
         else:
             st.info(banner)
 
-        with st.spinner("CodeMate（本地模拟）正在分析你的代码……"):
+        with st.spinner("CodeMate（本地规则）正在分析你的代码……"):
             for piece in mock_diagnose(code, question):
                 full_answer += piece
                 answer_placeholder.markdown(full_answer)
 
         st.session_state["last_answer"] = full_answer
         st.session_state["last_mode"] = "mock"
-        st.success("模拟诊断完成！配置有效 API Key 后，可获得针对你代码的真实逐行分析。")
+        st.success("规则诊断完成！配置有效 API Key 后，可获得针对你代码的真实逐行分析。")
+
+    # 调试信息：仅在开启调试模式时显示，绝不含完整 API Key
+    if debug_mode:
+        with st.expander("🔧 调试信息", expanded=True):
+            st.code(
+                f"base_url     = {base_url}\n"
+                f"model        = {model}\n"
+                f"key 掩码     = {key_meta['masked']}\n"
+                f"key 长度     = {key_meta['length']}\n"
+                f"key 是否ASCII = {key_meta['is_ascii']}\n"
+                f"key 以sk-开头 = {key_meta['starts_with_sk']}\n"
+                f"本次走模拟模式 = {use_mock}",
+                language="text",
+            )
+            if error_traceback:
+                st.caption("异常 traceback：")
+                st.code(error_traceback, language="text")
 
 elif st.session_state.get("last_answer"):
     st.divider()
     st.subheader("诊断结果")
+    if st.session_state.get("last_mode") == "mock":
+        st.warning("⚠️ 当前结果来源：本地规则兜底")
+    else:
+        st.success("✅ 当前结果来源：大模型诊断")
     st.markdown(st.session_state["last_answer"])
     if st.session_state.get("last_mode") == "mock":
-        st.caption("（以上结果来自本地模拟模式，未调用大模型）")
+        st.caption("（以上结果来自本地规则模式，未调用大模型）")
